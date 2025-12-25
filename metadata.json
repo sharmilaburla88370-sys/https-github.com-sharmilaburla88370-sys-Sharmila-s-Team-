@@ -1,0 +1,7 @@
+{
+  "name": "AI Scam Detector ",
+  "description": "A powerful AI-driven scam detection suite that analyzes suspicious messages, images, and real-time audio to protect users from phishing, fraud, and social engineering attacks.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
