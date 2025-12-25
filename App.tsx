@@ -7,7 +7,7 @@ import LiveGuardian from './components/LiveGuardian';
 import EducationSection from './components/EducationSection';
 import { ScamAnalysisResult } from './types';
 
-const App: React.FC = () => {
+const App: React.FCimp = () => {
   const [activeTab, setActiveTab] = useState<'analyze' | 'live' | 'education'>('analyze');
   const [lastResult, setLastResult] = useState<ScamAnalysisResult | null>(null);
 

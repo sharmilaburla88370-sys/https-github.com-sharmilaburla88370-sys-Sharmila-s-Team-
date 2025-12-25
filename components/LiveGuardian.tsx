@@ -3,16 +3,72 @@ import React, { useState, useRef, useEffect } from 'react';
 import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
 import { TranscriptionItem } from '../types';
 
+// Helper functions for audio encoding/decoding moved outside component to follow guidelines
+function decode(base64: string) {
+  const binaryString = atob(base64);
+  const len = binaryString.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes;
+}
+
+function encode(bytes: Uint8Array) {
+  let binary = '';
+  const len = bytes.byteLength;
+  for (let i = 0; i < len; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+async function decodeAudioData(
+  data: Uint8Array,
+  ctx: AudioContext,
+  sampleRate: number,
+  numChannels: number,
+): Promise<AudioBuffer> {
+  const dataInt16 = new Int16Array(data.buffer);
+  const frameCount = dataInt16.length / numChannels;
+  const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
+
+  for (let channel = 0; channel < numChannels; channel++) {
+    const channelData = buffer.getChannelData(channel);
+    for (let i = 0; i < frameCount; i++) {
+      channelData[i] = dataInt16[i * numChannels + channel] / 32768.0;
+    }
+  }
+  return buffer;
+}
+
+function createBlob(data: Float32Array) {
+  const l = data.length;
+  const int16 = new Int16Array(l);
+  for (let i = 0; i < l; i++) {
+    int16[i] = data[i] * 32768;
+  }
+  return {
+    data: encode(new Uint8Array(int16.buffer)),
+    mimeType: 'audio/pcm;rate=16000',
+  };
+}
+
 const LiveGuardian: React.FC = () => {
   const [isListening, setIsListening] = useState(false);
   const [transcriptions, setTranscriptions] = useState<TranscriptionItem[]>([]);
   const [riskLevel, setRiskLevel] = useState<'low' | 'high'>('low');
-  const [alert, setAlert] = useState<string | null>(null);
+  // Renamed from 'alert' to 'scamAlert' to avoid shadowing the global alert function (Fixes Error on line 117)
+  const [scamAlert, setScamAlert] = useState<string | null>(null);
   
   const scrollRef = useRef<HTMLDivElement>(null);
   const sessionRef = useRef<any>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const inputContextRef = useRef<AudioContext | null>(null);
+  
+  // Refs for gapless audio playback
+  const nextStartTimeRef = useRef<number>(0);
+  const activeSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
 
   // Auto-scroll transcriptions
   useEffect(() => {
@@ -21,44 +77,17 @@ const LiveGuardian: React.FC = () => {
     }
   }, [transcriptions]);
 
-  const decode = (base64: string) => {
-    const binaryString = atob(base64);
-    const bytes = new Uint8Array(binaryString.length);
-    for (let i = 0; i < binaryString.length; i++) {
-      bytes[i] = binaryString.charCodeAt(i);
-    }
-    return bytes;
-  };
-
-  const encode = (bytes: Uint8Array) => {
-    let binary = '';
-    for (let i = 0; i < bytes.byteLength; i++) {
-      binary += String.fromCharCode(bytes[i]);
-    }
-    return btoa(binary);
-  };
-
-  const createBlob = (data: Float32Array) => {
-    const l = data.length;
-    const int16 = new Int16Array(l);
-    for (let i = 0; i < l; i++) {
-      int16[i] = data[i] * 32768;
-    }
-    return {
-      data: encode(new Uint8Array(int16.buffer)),
-      mimeType: 'audio/pcm;rate=16000',
-    };
-  };
-
   const startListening = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // Initialize ai instance right before connect as per guidelines
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
       
       const inputCtx = new AudioContext({ sampleRate: 16000 });
       const outputCtx = new AudioContext({ sampleRate: 24000 });
       inputContextRef.current = inputCtx;
       audioContextRef.current = outputCtx;
+      nextStartTimeRef.current = 0;
 
       const sessionPromise = ai.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-09-2025',
@@ -76,6 +105,7 @@ const LiveGuardian: React.FC = () => {
             scriptProcessor.onaudioprocess = (e) => {
               const inputData = e.inputBuffer.getChannelData(0);
               const pcmBlob = createBlob(inputData);
+              // Ensure data is sent only after connection is established
               sessionPromise.then(session => session.sendRealtimeInput({ media: pcmBlob }));
             };
             source.connect(scriptProcessor);
@@ -88,44 +118,57 @@ const LiveGuardian: React.FC = () => {
               // Simple logic for UI demo - if certain keywords appear, toggle risk
               if (text.toLowerCase().includes('password') || text.toLowerCase().includes('bank')) {
                 setRiskLevel('high');
-                setAlert('WARNING: Potential social engineering detected!');
+                setScamAlert('WARNING: Potential social engineering detected!');
               }
             }
 
             if (message.serverContent?.outputTranscription) {
-               setTranscriptions(prev => [...prev, { speaker: 'AI', text: message.serverContent?.outputTranscription?.text || '', timestamp: Date.now() }]);
+               setTranscriptions(prev => [...prev, { speaker: 'AI', text: message.serverContent.outputTranscription.text || '', timestamp: Date.now() }]);
             }
 
-            // Handle audio output if Gemini speaks a warning
-            const audioData = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
-            if (audioData) {
-              const buffer = await decodeAudioData(decode(audioData), outputCtx);
-              const source = outputCtx.createBufferSource();
-              source.buffer = buffer;
-              source.connect(outputCtx.destination);
-              source.start();
+            // Handle audio output using gapless playback logic
+            const base64EncodedAudioString = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
+            if (base64EncodedAudioString && audioContextRef.current) {
+              const ctx = audioContextRef.current;
+              nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
+              
+              const audioBuffer = await decodeAudioData(decode(base64EncodedAudioString), ctx, 24000, 1);
+              const source = ctx.createBufferSource();
+              source.buffer = audioBuffer;
+              source.connect(ctx.destination);
+              
+              source.addEventListener('ended', () => {
+                activeSourcesRef.current.delete(source);
+              });
+
+              source.start(nextStartTimeRef.current);
+              nextStartTimeRef.current += audioBuffer.duration;
+              activeSourcesRef.current.add(source);
+            }
+
+            // Handle interruptions
+            if (message.serverContent?.interrupted) {
+              for (const source of activeSourcesRef.current.values()) {
+                source.stop();
+              }
+              activeSourcesRef.current.clear();
+              nextStartTimeRef.current = 0;
             }
           },
           onclose: () => stopListening(),
-          onerror: (e) => console.error(e)
+          onerror: (e) => {
+            console.error('Live API Error:', e);
+            stopListening();
+          }
         }
       });
 
       sessionRef.current = await sessionPromise;
     } catch (err) {
       console.error(err);
-      alert('Could not access microphone.');
+      // Use window.alert here since it's an error outside the UI state management
+      window.alert('Could not access microphone.');
     }
-  };
-
-  const decodeAudioData = async (data: Uint8Array, ctx: AudioContext) => {
-    const dataInt16 = new Int16Array(data.buffer);
-    const buffer = ctx.createBuffer(1, dataInt16.length, 24000);
-    const channelData = buffer.getChannelData(0);
-    for (let i = 0; i < dataInt16.length; i++) {
-      channelData[i] = dataInt16[i] / 32768.0;
-    }
-    return buffer;
   };
 
   const stopListening = () => {
@@ -133,8 +176,14 @@ const LiveGuardian: React.FC = () => {
     if (inputContextRef.current) inputContextRef.current.close();
     if (audioContextRef.current) audioContextRef.current.close();
     setIsListening(false);
-    setAlert(null);
+    setScamAlert(null);
     setRiskLevel('low');
+    
+    // Stop all active audio sources
+    for (const source of activeSourcesRef.current.values()) {
+      try { source.stop(); } catch(e) {}
+    }
+    activeSourcesRef.current.clear();
   };
 
   return (
@@ -173,12 +222,12 @@ const LiveGuardian: React.FC = () => {
             )}
           </button>
 
-          {alert && (
+          {scamAlert && (
             <div className="mt-6 bg-red-600 text-white p-4 rounded-xl animate-bounce flex items-center gap-3 font-bold text-sm">
               <svg className="w-6 h-6 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
               </svg>
-              {alert}
+              {scamAlert}
             </div>
           )}
         </div>
